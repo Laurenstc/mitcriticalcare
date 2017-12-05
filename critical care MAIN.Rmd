@@ -1,0 +1,508 @@
+---
+title: "MIT critical care"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+install.packages("RPostgreSQL")
+install.packages("DBI")
+library(DBI)
+library(RPostgreSQL)
+install.packages("reshape2")
+library(reshape2)
+
+install.packages("arules")
+install.packages("arulesViz")
+library(arules)
+library(arulesViz)
+
+install.packages("Hmisc")
+library(Hmisc)
+
+library(caret)
+```
+
+```{r}
+# Load configuration settings
+dbdriver <- 'PostgreSQL'
+host  <- 'placeholder'
+port  <- '5432'
+user  <- 'placeholder'
+password <- 'placeholder'
+dbname <- 'mimic'
+schema <- 'mimiciii'
+
+# Connect to the database using the configuration settings
+con <- dbConnect(dbDriver(dbdriver), dbname = dbname, host = host, port = port, 
+                 user = user, password = password)
+
+# Set the default schema
+dbExecute(con, paste("SET search_path TO ", schema, sep=" "))
+
+```
+
+
+
+```{r}
+#example query
+sql_test_query <- "SELECT i.subject_id, i.hadm_id, i.los FROM icustays i;"
+data <- dbGetQuery(con, sql_test_query)
+```
+
+SQL query for sepsis patients in MIMICiii dataset
+-- ICD-9 codes for Angus criteria of sepsis
+
+-- Angus et al, 2001. Epidemiology of severe sepsis in the United States
+-- http://www.ncbi.nlm.nih.gov/pubmed/11445675
+
+-- Case selection and definitions
+-- To identify cases with severe sepsis, we selected all acute care
+-- hospitalizations with ICD-9-CM codes for both:
+-- (a) a bacterial or fungal infectious process AND
+-- (b) a diagnosis of acute organ dysfunction (Appendix 2).
+```{r}
+sql_sepsis_query <- "WITH infection_group AS 
+(
+	SELECT subject_id, hadm_id,
+	CASE
+		WHEN substring(icd9_code,1,3) IN ('001','002','003','004','005','008',
+			   '009','010','011','012','013','014','015','016','017','018',
+			   '020','021','022','023','024','025','026','027','030','031',
+			   '032','033','034','035','036','037','038','039','040','041',
+			   '090','091','092','093','094','095','096','097','098','100',
+			   '101','102','103','104','110','111','112','114','115','116',
+			   '117','118','320','322','324','325','420','421','451','461',
+			   '462','463','464','465','481','482','485','486','494','510',
+			   '513','540','541','542','566','567','590','597','601','614',
+			   '615','616','681','682','683','686','730') THEN 1
+		WHEN substring(icd9_code,1,4) IN ('5695','5720','5721','5750','5990','7110',
+				'7907','9966','9985','9993') THEN 1
+		WHEN substring(icd9_code,1,5) IN ('49121','56201','56203','56211','56213',
+				'56983') THEN 1
+		ELSE 0 END AS infection
+	FROM diagnoses_icd
+),
+
+organ_diag_group as
+(
+	SELECT subject_id, hadm_id,
+		CASE
+		-- Acute Organ Dysfunction Diagnosis Codes
+		WHEN substring(icd9_code,1,3) IN ('458','293','570','584') THEN 1
+		WHEN substring(icd9_code,1,4) IN ('7855','3483','3481',
+				'2874','2875','2869','2866','5734')  THEN 1
+		ELSE 0 END AS organ_dysfunction,
+		-- Explicit diagnosis of severe sepsis or septic shock
+		CASE
+		WHEN substring(icd9_code,1,5) IN ('99592','78552')  THEN 1
+		ELSE 0 END AS explicit_sepsis
+	FROM diagnoses_icd
+),
+
+organ_proc_group as
+(
+	SELECT subject_id, hadm_id,
+		CASE
+		WHEN substring(icd9_code,1,4) IN ('9670','9671','9672') THEN 1
+		ELSE 0 END AS mech_vent
+	FROM procedures_icd
+),
+
+aggregate as
+(
+	SELECT subject_id, hadm_id,
+		CASE
+			WHEN hadm_id in
+					(SELECT DISTINCT hadm_id
+					FROM infection_group
+					WHERE infection = 1)
+				THEN 1
+			ELSE 0 END AS infection,
+		CASE
+			WHEN hadm_id in
+					(SELECT DISTINCT hadm_id
+					FROM organ_diag_group
+					WHERE explicit_sepsis = 1)
+				THEN 1
+			ELSE 0 END AS explicit_sepsis,
+		CASE
+			WHEN hadm_id in
+					(SELECT DISTINCT hadm_id
+					FROM organ_diag_group
+					WHERE organ_dysfunction = 1)
+				THEN 1
+			ELSE 0 END AS organ_dysfunction,
+		CASE
+		WHEN hadm_id in
+				(SELECT DISTINCT hadm_id
+				FROM organ_proc_group
+				WHERE mech_vent = 1)
+			THEN 1
+		ELSE 0 END AS mech_vent
+	FROM admissions
+)
+
+SELECT subject_id, hadm_id, infection,
+   explicit_sepsis, organ_dysfunction, mech_vent,
+CASE
+	WHEN explicit_sepsis = 1 THEN 1
+	WHEN infection = 1 AND organ_dysfunction = 1 THEN 1
+	WHEN infection = 1 AND mech_vent = 1 THEN 1
+	ELSE 0 END
+AS angus
+FROM aggregate;"
+
+
+df <- tbl_df(dbGetQuery(con, sql_sepsis_query))
+
+sepsis <- df %>% 
+  filter(explicit_sepsis == 1)
+write.csv(sepsis, "~/IE-BIGDATA/Hackathons/MIT critical care datathon/sepsis.csv", fileEncoding = 'utf-8')
+glimpse(sepsis)
+```
+
+```{r}
+septicshock_query <- "WITH t1 AS (
+SELECT 
+  diagnoses_icd.subject_id,
+  diagnoses_icd.icd9_code, 
+  diagnoses_icd.hadm_id
+FROM 
+  mimiciii.d_icd_diagnoses, 
+  mimiciii.diagnoses_icd
+WHERE diagnoses_icd.icd9_code = '78552'
+GROUP BY diagnoses_icd.subject_id, diagnoses_icd.icd9_code, diagnoses_icd.hadm_id
+limit 50000
+)
+
+SELECT t1.subject_id, t1.hadm_id, count(*) as count
+FROM t1
+GROUP BY t1.subject_id, t1.hadm_id
+HAVING count(*) = 1
+;"
+
+septickschock <- tbl_df(dbGetQuery(con, septicshock_query))
+
+septicshock <- septickschock %>%
+  select(-count)
+```
+
+```{r}
+whitecells_query <- "WITH t1 AS (
+SELECT 
+  diagnoses_icd.subject_id,
+  diagnoses_icd.icd9_code, 
+  diagnoses_icd.hadm_id
+FROM 
+  mimiciii.d_icd_diagnoses, 
+  mimiciii.diagnoses_icd
+WHERE diagnoses_icd.icd9_code IN ('28800', '28801', '28802', '28803', '28804', '28809', '28953', '7767')
+GROUP BY diagnoses_icd.subject_id, diagnoses_icd.icd9_code, diagnoses_icd.hadm_id
+limit 50000
+)
+
+SELECT t1.subject_id, t1.hadm_id, count(*) as count
+FROM t1
+GROUP BY t1.subject_id, t1.hadm_id
+HAVING count(*) = 1
+;"
+
+whiteblood <- tbl_df(dbGetQuery(con, whitecells_query))
+
+whiteblood <- whiteblood %>%
+  select(-count)
+```
+
+```{r}
+dischargedeath_query <- "SELECT row_id, subject_id, hadm_id FROM mimiciii.admissions WHERE discharge_location = 'DEAD/EXPIRED';"
+
+dischargedeath <- tbl_df(dbGetQuery(con, dischargedeath_query))
+```
+
+
+```{r}
+#oasis score dataframe
+oasisdf <- read_csv("OASIStabel.csv")
+```
+
+```{r}
+
+#details icustay
+icudetails <- read_csv("ICUdetails.csv")
+#filter on age > 16 and 1st admission in ICU and Hospital
+icudetails2 <- icudetails %>%
+  filter(first_icu_stay=="Y") %>%
+  filter(first_hosp_stay == "Y")
+```
+
+```{r}
+#antibiotics info
+antibiotics <- read_csv("ANTIBIOTICS.csv")
+
+antibiotics <- antibiotics %>% select(subject_id, hadm_id, icustay_id, drug_formatted)
+
+antibiotics <- dcast(antibiotics, subject_id + hadm_id + icustay_id ~ drug_formatted)
+```
+
+```{r}
+#SOFA var
+sofa <- read_csv("SOFA.csv")
+```
+
+```{r}
+df1 <- merge(x=sepsis, y=oasisdf, by=c('subject_id','hadm_id') )
+
+df2 <- merge(x=df1, y=icudetails2, by=c('subject_id','hadm_id', 'icustay_id') )
+
+
+
+#fixed the duplicate issue by using semi_join. - 1510 records
+df3 <- merge(x=df2, y=antibiotics, by=c('subject_id', 'hadm_id', 'icustay_id'))
+
+fulldf2 <- df3 %>%
+  select(-explicit_sepsis, -age.y, -preiculos_score, -age_score, -gcs_score, -heartrate_score, -meanbp_score, -resprate_score, -temp_score, -urineoutput_score, -mechvent_score, -electivesurgery_score, -ethnicity_1, -hospital_expire_flag.y, -first_hosp_stay, -first_icu_stay, -intime_1, -outtime_1, -angus, -icustay_age_group, -infection, -dob) %>% 
+  rename(age=age.x) %>%
+  rename(hospital_expire_flag = hospital_expire_flag.x)
+
+
+
+#combine septicshock with dataframe
+tempdf <- fulldf2 %>% 
+  select(subject_id, hadm_id)
+tempdf2 <- intersect(tempdf, septicshock) %>%
+  mutate(septicshock = 1)
+tempdf3 <- setdiff(tempdf, septicshock) %>%
+  mutate(septicshock = 0)
+
+tempdf4 <- bind_rows(tempdf2, tempdf3)
+fulldf2 <- left_join(fulldf2, tempdf4, by=c('subject_id', 'hadm_id'))
+
+#combine whiteblood cells with datafram
+tempdf4 <- intersect(tempdf2, whiteblood) %>%
+  mutate(whiteblood = 1)
+tempdf5 <- setdiff(tempdf2, whiteblood) %>%
+  mutate(whiteblood = 0)
+
+tempdf6 <- bind_rows(tempdf4, tempdf5)
+fulldf2 <- left_join(fulldf2, tempdf6, by=c('subject_id', 'hadm_id'))
+fulldf2 <- fulldf2 %>%
+  filter(whiteblood == 0) %>%
+  select(-whiteblood)
+
+fulldf2 <- fulldf2 %>%
+  select(-dod)
+
+fulldf2 <- fulldf2 %>%
+  mutate(mortality = ifelse(is.na(deathtime), 0, 1))
+
+sofa <- sofa %>%
+  select(subject_id, hadm_id, icustay_id, sofa)
+
+fulldf2 <- left_join(fulldf2, sofa, by=c('subject_id', 'hadm_id', 'icustay_id'))
+
+
+fulldf2 <- fulldf2 %>%
+  select(-admittime, -dischtime, -deathtime, -icustay_seq, -intime, -outtime, -hospstay_seq)
+
+fulldf2 <- fulldf2 %>%
+  filter(`cefepime desensitization` == 0) %>%
+  select(-`neo*iv*piperacillin-tazobactam`, -`cefepime desensitization`) %>%
+  mutate(cefepime = ifelse(cefepime == 0, 0, 1)) %>%
+  mutate(pipetazo = ifelse(`piperacillin-tazobactam` == 0, 0, 1)) 
+
+
+fulldf2 <- fulldf2 %>%
+  filter(drug_formatted != 'cefepime desensitization')
+
+```
+
+Merging dataframes
+```{r}
+df1 <- merge(x=sepsis, y=oasisdf, by=c('subject_id','hadm_id') )
+
+df2 <- merge(x=df1, y=icudetails2, by=c('subject_id','hadm_id', 'icustay_id') )
+
+
+
+#fixed the duplicate issue by using semi_join. - 1510 records
+df3 <- merge(x=df2, y=antibiotics, by=c('subject_id', 'hadm_id', 'icustay_id'))
+
+fulldf <- df3 %>%
+  select(-explicit_sepsis, -age.y, -preiculos_score, -age_score, -gcs_score, -heartrate_score, -meanbp_score, -resprate_score, -temp_score, -urineoutput_score, -mechvent_score, -electivesurgery_score, -ethnicity_1, -hospital_expire_flag.y, -first_hosp_stay, -first_icu_stay, -intime_1, -outtime_1, -angus, -icustay_age_group, -infection, -dob) %>% 
+  rename(age=age.x) %>%
+  rename(hospital_expire_flag = hospital_expire_flag.x)
+
+
+
+#combine septicshock with dataframe
+tempdf <- fulldf %>% 
+  select(subject_id, hadm_id)
+tempdf2 <- intersect(tempdf, septicshock) %>%
+  mutate(septicshock = 1)
+tempdf3 <- setdiff(tempdf, septicshock) %>%
+  mutate(septicshock = 0)
+
+tempdf4 <- bind_rows(tempdf2, tempdf3)
+fulldf <- left_join(fulldf, tempdf4, by=c('subject_id', 'hadm_id'))
+
+#combine whiteblood cells with datafram
+tempdf4 <- intersect(tempdf, whiteblood) %>%
+  mutate(whiteblood = 1)
+tempdf5 <- setdiff(tempdf, whiteblood) %>%
+  mutate(whiteblood = 0)
+
+tempdf6 <- bind_rows(tempdf4, tempdf5)
+fulldf <- left_join(fulldf, tempdf6, by=c('subject_id', 'hadm_id'))
+fulldf <- fulldf %>%
+  filter(whiteblood == 0) %>%
+  select(-whiteblood)
+
+fulldf <- fulldf %>%
+  select(-dod)
+
+fulldf <- fulldf %>%
+  mutate(mortality = ifelse(is.na(deathtime), 0, 1))
+
+sofa <- sofa %>%
+  select(subject_id, hadm_id, icustay_id, sofa)
+
+fulldf <- left_join(fulldf, sofa, by=c('subject_id', 'hadm_id', 'icustay_id'))
+
+
+fulldf <- fulldf %>%
+  select(-admittime, -dischtime, -deathtime, -icustay_seq, -intime, -outtime, -hospstay_seq)
+
+fulldf <- fulldf %>%
+  filter(`cefepime desensitization` == 0) %>%
+  select(-`neo*iv*piperacillin-tazobactam`, -`cefepime desensitization`) %>%
+  mutate(cefepime = ifelse(cefepime == 0, 0, 1)) %>%
+  mutate(pipetazo = ifelse(`piperacillin-tazobactam` == 0, 0, 1)) 
+
+
+fulldf <- fulldf %>%
+  select(-`cefepime desensitization`)
+
+
+write.csv(fulldf, "~/IE-BIGDATA/Hackathons/MIT critical care datathon/fulldf.csv", fileEncoding = 'utf-8')
+```
+
+
+cleaning data
+```{r}
+cleaneddf <- fulldf
+
+cleaneddf$X <- NULL
+cleaneddf$preiculos <- NULL
+cleaneddf$hospital_expire_flag <- NULL
+cleaneddf$icustay_expire_flag <- NULL
+cleaneddf$mechvent <- NULL
+cleaneddf$ethnicity <- NULL
+cleaneddf$oasis <- scale(cleaneddf$oasis, center = FALSE)#o log?
+cleaneddf$age <- scale(cleaneddf$age, center = FALSE)
+cleaneddf$gcs <- scale(cleaneddf$gcs, center = FALSE)
+cleaneddf$heartrate <- scale(cleaneddf$heartrate, center = FALSE)
+cleaneddf$meanbp <- scale(cleaneddf$meanbp, center = FALSE)
+cleaneddf$resprate <- scale(cleaneddf$resprate, center = FALSE)
+cleaneddf$temp <- scale(cleaneddf$temp, center = FALSE)
+cleaneddf$urineoutput <- scale(cleaneddf$urineoutput, center = FALSE)
+cleaneddf$los_hospital <- scale(cleaneddf$los_hospital, center = FALSE)
+cleaneddf$los_icu <- scale(cleaneddf$los_icu, center = FALSE)
+cleaneddf$sofa <- scale(cleaneddf$sofa, center = FALSE)
+cleaneddf$organ_dysfunction <- as.character(cleaneddf$organ_dysfunction)
+cleaneddf[cleaneddf$organ_dysfunction=='0',]$organ_dysfunction <- 'N'
+cleaneddf[cleaneddf$organ_dysfunction=='1',]$organ_dysfunction <- 'Y'
+cleaneddf$mech_vent <- as.character(cleaneddf$mech_vent)
+cleaneddf[cleaneddf$mech_vent=='0',]$mech_vent <- 'N'
+cleaneddf[cleaneddf$mech_vent=='1',]$mech_vent <- 'Y'
+cleaneddf$electivesurgery <- as.character(cleaneddf$electivesurgery)
+cleaneddf[cleaneddf$electivesurgery=='0',]$electivesurgery <- 'N'
+cleaneddf[cleaneddf$electivesurgery=='1',]$electivesurgery <- 'Y'
+cleaneddf$cefepime <- as.character(cleaneddf$cefepime)
+cleaneddf[cleaneddf$cefepime=='0',]$cefepime <- 'N'
+cleaneddf[cleaneddf$cefepime=='1',]$cefepime <- 'Y'
+cleaneddf$pipetazo <- as.character(cleaneddf$pipetazo)
+cleaneddf[cleaneddf$pipetazo=='0',]$pipetazo <- 'N'
+cleaneddf[cleaneddf$pipetazo=='1',]$pipetazo <- 'Y'
+cleaneddf$septicshock <- as.character(cleaneddf$septicshock)
+cleaneddf[cleaneddf$septicshock=='0',]$septicshock <- 'N'
+cleaneddf[cleaneddf$septicshock=='1',]$septicshock <- 'Y'
+cleaneddf$mortality <- as.character(cleaneddf$mortality)
+cleaneddf[cleaneddf$mortality=='0',]$mortality <- 'ALIVE'
+cleaneddf[cleaneddf$mortality=='1',]$mortality <- 'DEAD'
+
+
+#make factors /logicals
+
+cleaneddf$organ_dysfunction <- as.factor(cleaneddf$organ_dysfunction)
+
+cleaneddf$mech_vent <- as.factor(cleaneddf$mech_vent)
+
+cleaneddf$electivesurgery <- as.factor(cleaneddf$electivesurgery)
+
+cleaneddf$cefepime <- as.factor(cleaneddf$cefepime)
+
+cleaneddf$pipetazo <- as.factor(cleaneddf$pipetazo)
+
+cleaneddf$septicshock <- as.factor(cleaneddf$septicshock)
+
+cleaneddf$mortality <- as.factor(cleaneddf$mortality)
+
+cleaneddf$gender <- as.factor(cleaneddf$gender)
+
+cleaneddf$admission_type <- as.factor(cleaneddf$admission_type)
+
+
+
+```
+
+
+
+modelling analysis
+```{r}
+
+#length of stay vis
+ggplot(data=fulldf2, aes(y=los_icu, x=as.factor(drug_formatted))) +
+  geom_boxplot() +
+  stat_summary(fun.y=mean, geom="point", col="red",size=3)
+
+#mortality vis
+ggplot(data=fulldf2, aes(y=mortality, x=as.factor(drug_formatted))) +
+  geom_point() +
+  stat_summary(fun.y=mean, geom="point", col="red",size=3)
+
+#length of stay t.test
+t.test(fulldf2$los_icu[fulldf2$drug_formatted == 'piperacillin-tazobactam'], fulldf2$los_icu[fulldf2$drug_formatted == 'cefepime'], alternative='two.sided', paired=F)
+
+#mortality t.test
+t.test(fulldf2$mortality[fulldf2$drug_formatted == 'piperacillin-tazobactam'], fulldf2$mortality[fulldf2$drug_formatted == 'cefepime'], alternative='two.sided', paired=F)
+
+#regressions
+set.seed(42)
+inTraining <- createDataPartition(fulldf2$mortality, p = .80, list = FALSE)
+train <- fulldf2[ inTraining,]
+test  <- fulldf2[-inTraining,]
+
+#mortality linear model
+model <- glm(mortality ~ (organ_dysfunction + oasis + mech_vent + age + gender +sofa) * drug_formatted, data=train, family=binomial)
+
+#
+model3 <- glm(mortality ~ organ_dysfunction + mech_vent + age + gender +sofa + drug_formatted*oasis, data=train, family=binomial)
+
+ggplot(data=)
+
+
+#2 predictors: oasis and mech_vent, drug choice not relevant
+
+#los_icu model
+model2 <- lm(los_icu ~ organ_dysfunction + oasis + mech_vent + age + gender +drug_formatted+ septicshock+ sofa,data=train)
+
+
+
+```
+
+
+
+
